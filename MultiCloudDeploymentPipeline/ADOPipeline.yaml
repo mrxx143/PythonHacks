@@ -1,0 +1,198 @@
+name: VecSynth-AI-ADO-Pipeline
+
+trigger:
+  branches:
+    include:
+      - develop
+      - release
+      - master
+
+variables:
+  foldervalue: 'infracicd'
+  aws.rolecredential.maxduration: "3600"
+
+############################################################
+# Terraform PLAN Stage
+############################################################
+
+stages:
+- stage: TF_Plan
+  displayName: Terraform Plan Stage
+  condition: and(ne(variables['Build.SourceBranch'], 'refs/heads/release'), ne(variables['Build.SourceBranch'], 'refs/heads/master'))
+
+  jobs:
+  - job: Plan
+    displayName: Terraform Plan (AWS + Azure)
+    pool:
+      vmImage: ubuntu-latest
+
+    variables:
+      - group: AWS-Pipeline
+
+    steps:
+
+    - checkout: self
+
+############################################################
+# Install Terraform
+############################################################
+
+    - task: TerraformInstaller@1
+      displayName: Install Terraform
+      inputs:
+        terraformVersion: '1.8.4'
+
+############################################################
+# AWS OIDC Authentication
+############################################################
+
+    - task: AWSShellScript@1
+      displayName: Get AWS OIDC Credentials
+      inputs:
+        awsCredentials: 'aws-odic-sc'
+        regionName: '$(AWS_REGION)'
+        scriptType: inline
+        inlineScript: |
+
+          echo "===== AWS Authentication ====="
+          aws sts get-caller-identity
+
+          echo "Export AWS credentials to pipeline variables"
+
+          echo "##vso[task.setvariable variable=AWS_ACCESS_KEY_ID]$AWS_ACCESS_KEY_ID"
+          echo "##vso[task.setvariable variable=AWS_SECRET_ACCESS_KEY]$AWS_SECRET_ACCESS_KEY"
+          echo "##vso[task.setvariable variable=AWS_SESSION_TOKEN]$AWS_SESSION_TOKEN"
+
+############################################################
+# Terraform Init + Plan inside Azure login
+############################################################
+
+    - task: AzureCLI@2
+      displayName: Terraform Init and Plan
+      inputs:
+        azureSubscription: azure-sc
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          echo "===== Azure Authentication ====="
+          az account show
+
+          echo "===== AWS Authentication ====="
+          aws sts get-caller-identity
+
+          cd $(foldervalue)
+
+          echo "===== Terraform Init ====="
+
+          terraform init -reconfigure \
+            -backend-config="bucket=$(TFSTATE_BUCKET)" \
+            -backend-config="key=vecsyth/terraform.tfstate" \
+            -backend-config="region=$(AWS_REGION)" \
+            -backend-config="dynamodb_table=$(TFSTATE_DDB_TABLE)" \
+            -backend-config="encrypt=true"
+
+          echo "===== Terraform Validate ====="
+          terraform validate
+
+          echo "===== Terraform Plan ====="
+          terraform plan -out=tfplan
+
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+
+############################################################
+# Terraform APPLY Stage
+############################################################
+
+- stage: TF_Apply
+  displayName: Terraform Apply Stage
+  dependsOn: TF_Plan
+  condition: succeeded('TF_Plan')
+
+  jobs:
+  - deployment: Apply
+    displayName: Terraform Apply
+    environment: AWS-Approvers
+
+    pool:
+      vmImage: ubuntu-latest
+
+    variables:
+      - group: AWS-Pipeline
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - checkout: self
+
+############################################################
+# Install Terraform
+############################################################
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: '1.8.4'
+
+############################################################
+# AWS OIDC Authentication
+############################################################
+
+          - task: AWSShellScript@1
+            displayName: Get AWS OIDC Credentials
+            inputs:
+              awsCredentials: 'aws-odic-sc'
+              regionName: '$(AWS_REGION)'
+              scriptType: inline
+              inlineScript: |
+
+                echo "===== AWS Authentication ====="
+                aws sts get-caller-identity
+
+                echo "Export AWS credentials to pipeline variables"
+
+                echo "##vso[task.setvariable variable=AWS_ACCESS_KEY_ID]$AWS_ACCESS_KEY_ID"
+                echo "##vso[task.setvariable variable=AWS_SECRET_ACCESS_KEY]$AWS_SECRET_ACCESS_KEY"
+                echo "##vso[task.setvariable variable=AWS_SESSION_TOKEN]$AWS_SESSION_TOKEN"
+
+############################################################
+# Terraform Apply inside Azure login
+############################################################
+
+          - task: AzureCLI@2
+            displayName: Terraform Apply
+            inputs:
+              azureSubscription: azure-sc
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+
+                echo "===== Azure Authentication ====="
+                az account show
+
+                echo "===== AWS Authentication ====="
+                aws sts get-caller-identity
+
+                cd $(foldervalue)
+
+                echo "===== Terraform Init ====="
+
+                terraform init -reconfigure \
+                  -backend-config="bucket=$(TFSTATE_BUCKET)" \
+                  -backend-config="key=vecsyth/terraform.tfstate" \
+                  -backend-config="region=$(AWS_REGION)" \
+                  -backend-config="dynamodb_table=$(TFSTATE_DDB_TABLE)" \
+                  -backend-config="encrypt=true"
+
+                echo "===== Terraform Apply ====="
+                terraform apply -auto-approve
+
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
